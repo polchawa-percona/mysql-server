@@ -96,7 +96,7 @@ bool Instant_ddl_impl<Table>::is_instant_add_drop_possible(
       dummy_col.set_mbminmaxlen(mbminlen, mbmaxlen);
       dict_field_t dummy_field;
       dummy_field.col = &dummy_col;
-      get_field_max_size(dict_table, index, &dummy_field, field_max_size);
+      get_field_max_size(dict_table, index, &dummy_field, true, field_max_size);
     }
 
     current_max_size += field_max_size;
