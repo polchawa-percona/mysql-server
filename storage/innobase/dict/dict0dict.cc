@@ -2068,7 +2068,7 @@ ulint dict_index_node_ptr_max_size(const dict_index_t *index) /*!< in: index */
   /* Compute the maximum possible record size. */
   for (i = 0; i < dict_index_get_n_unique_in_tree(index); i++) {
     const dict_field_t *field = index->get_field(i);
-    get_field_max_size(index->table, index, field, rec_max_size);
+    get_field_max_size(index->table, index, field, false, rec_max_size);
   }
 
   return (rec_max_size);
@@ -2109,7 +2109,8 @@ void get_permissible_max_size(const dict_table_t *table,
 }
 
 void get_field_max_size(const dict_table_t *table, const dict_index_t *index,
-                        const dict_field_t *field, size_t &rec_max_size) {
+                        const dict_field_t *field, bool backward_compatible,
+                        size_t &rec_max_size) {
   /* Determine the maximum length of the index field. In case ROW_FORMAT is
   not REDUNDANT, this function should take into account the extra bytes needed
   to encode the variable length of the field, computed as the worst case in
@@ -2137,7 +2138,8 @@ void get_field_max_size(const dict_table_t *table, const dict_index_t *index,
   length. This is why we don't need to check if the field is the first field of
   the spatial index once we see it is DATA_GEOMETRY. We can't check this anyway,
   because the field might be a dummy object not yet added to the index. */
-  if (dict_index_is_spatial(index) && col->mtype == DATA_GEOMETRY) {
+  if (dict_index_is_spatial(index) && col->mtype == DATA_GEOMETRY &&
+      !backward_compatible) {
     rec_max_size += DATA_MBR_LEN + 1;
     return;
   }
@@ -2158,7 +2160,8 @@ void get_field_max_size(const dict_table_t *table, const dict_index_t *index,
   always_inlined. Otherwise fields used in B-tree navigation could be
   arbitrarily long, which is impossible to handle efficiently. */
   ut_ad(!(always_inlined && field_max_size == ULINT_MAX &&
-          field->prefix_len == 0));
+          field->prefix_len == 0 &&
+          (!backward_compatible || col->mtype != DATA_GEOMETRY)));
 
   if (field->prefix_len) {
     ut_ad(always_inlined);
@@ -2194,8 +2197,16 @@ void get_field_max_size(const dict_table_t *table, const dict_index_t *index,
   /* Sanity check, preventing overflow. Note that col->get_max_size()==ULINT_MAX
   implies DATA_BIG_COL(col), and we don't have secondary indexes on BLOBs
   without prefix_len, so if you combine all the logical conditions leading to
-  this line, you should see why it must hold. */
-  ut_ad(field_max_size != ULINT_MAX);
+  this line, you should see why it must hold.
+
+  The only exception when we allow the overflow to happen is when we need to be
+  backward compatible with older MySQL versions (we allow the overflow to allow
+  table creations that previously were allowed).
+
+  Note: when checking if we should x-latch a node, we do NOT allow overflow to
+  happen here (backward compatibility is not a concern then). */
+  ut_ad(field_max_size != ULINT_MAX ||
+        (col->mtype == DATA_GEOMETRY && backward_compatible));
 
   if (comp) {
     /* Add the extra size for ROW_FORMAT=COMPACT.
@@ -2271,7 +2282,7 @@ bool dict_index_validate_max_rec_size(const dict_table_t *table,
   /* Compute the maximum possible record size. */
   for (size_t i = 0; i < index->n_fields; i++) {
     const dict_field_t *field = index->get_field(i);
-    get_field_max_size(table, index, field, rec_max_size);
+    get_field_max_size(table, index, field, true, rec_max_size);
 
     /* Check the size limit on leaf pages. */
     if (rec_max_size >= page_rec_max) {
