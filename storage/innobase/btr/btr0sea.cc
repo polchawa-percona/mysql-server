@@ -211,8 +211,8 @@ void btr_search_sys_t::search_part_t::initialize(size_t hash_size) {
   rw_lock_create(btr_search_latch_key, &latch, LATCH_ID_BTR_SEARCH);
 
   /* Step-2: Allocate hash tables. */
-  hash_table = ib_create((hash_size / btr_ahi_parts), LATCH_ID_HASH_TABLE_MUTEX,
-                         0, MEM_HEAP_FOR_BTR_SEARCH);
+  hash_table = ib_create((hash_size / btr_ahi_parts), LATCH_ID_NONE, 0,
+                         MEM_HEAP_FOR_BTR_SEARCH);
   hash_table->heap->free_block_ptr = &free_block_for_heap;
 
 #if defined UNIV_AHI_DEBUG || defined UNIV_DEBUG
@@ -239,9 +239,8 @@ void btr_search_sys_resize(ulint hash_size) {
     mem_heap_free(part.hash_table->heap);
     ut::delete_(part.hash_table);
 
-    part.hash_table =
-        ib_create((hash_size / btr_ahi_parts), LATCH_ID_HASH_TABLE_MUTEX, 0,
-                  MEM_HEAP_FOR_BTR_SEARCH);
+    part.hash_table = ib_create((hash_size / btr_ahi_parts), LATCH_ID_NONE, 0,
+                                MEM_HEAP_FOR_BTR_SEARCH);
     part.hash_table->heap->free_block_ptr = &part.free_block_for_heap;
 
 #if defined UNIV_AHI_DEBUG || defined UNIV_DEBUG
@@ -1032,67 +1031,26 @@ void btr_search_drop_page_hash_index(buf_block_t *block, bool force) {
       return;
     }
 
-    /* Is it safe to dereference the index here?
-    If this method is called from a method that uses reference to the index, or
-    a cursor on that index, it should not be freed until they finish. Such
-    methods are:
-    - btr_free_root,
-    - btr_page_reorganize_low,
-    - btr_page_empty,
-    - btr_lift_page_up,
-    - btr_compress,
-    - btr_discard_only_page_on_level,
-    - btr_discard_page,
-    - btr_search_update_hash_on_move, which in turn is called from:
-      - btr_root_raise_and_insert
-      - btr_page_split_and_insert
-      - btr_lift_page_up
-      - page_copy_rec_list_end
-      - page_copy_rec_list_start
-    - btr_search_build_page_hash_index, which in turn is called from
-      - btr_search_info_update_slow
-      - btr_search_update_hash_on_move
-    - page_zip_reorganize
-
-    There is a btr_search_drop_page_hash_when_freed() that is calling this
-    method, but it asserts:
-    ut_ad(index->table->n_ref_count > 0 || dict_sys_mutex_own());
-    This checks the table is opened or we have dict sys mutex, either of which
-    should prevent index from being freed. Assuming the current thread is the
-    one that keeps the table open, which we can't assure easily, but checking if
-    the current thread keeps the current block S- or X-latched should make it
-    almost certain.
-
-    The last other call is from buf_LRU_free_page(). It does not hold index or
-    any latches that could prevent the index from being freed. However, while
-    the block is in AHI, it will prevent the index from being freed - the
-    block.ahi.index->search_info->ref_count will be positive, and the
-    dict_index_remove_from_cache_low() will assure it is 0 before the index is
-    freed. The buf_LRU_free_page() first removes the block from all lists and
-    hashes, so at the point this method is called, it will be held "privately" -
-    no other thread will be able to reach it without iterating every block in
-    chunks in the Buffer Pool. So, for index to be freed here after it was
-    checked to not be nullptr, it would require some other thread to iterate
-    entire Buffer Pool and remove this block from AHI. Something similar is done
-    during btr_search_disable(), but in buf_pool_clear_hash_index() we latch the
-    block's mutex to prevent block state change, and verify the state is not
-    BUF_BLOCK_REMOVE_HASH. Note that the block that we currently process a part
-    of buf_LRU_free_page() must be in this state. */
-    ut_d(bool block_held_in_private =
-             buf_block_get_state(block) == BUF_BLOCK_REMOVE_HASH);
-    ut_d(bool index_is_open = index->table->n_ref_count > 0);
-    ut_d(bool block_is_being_accessed = rw_lock_own_flagged(
-             &block->lock, RW_LOCK_FLAG_S | RW_LOCK_FLAG_X));
-    ut_d(bool index_cant_be_freed =
-             (index_is_open && block_is_being_accessed) ||
-             dict_sys_mutex_own());
-    ut_ad(block_held_in_private || index_cant_be_freed);
+    /* Ensure that it is safe to use the index here. */
+#ifdef UNIV_DEBUG
+    const bool block_held_in_private =
+        buf_block_get_state(block) == BUF_BLOCK_REMOVE_HASH;
+    const bool block_is_latched =
+        rw_lock_own_flagged(&block->lock, RW_LOCK_FLAG_S | RW_LOCK_FLAG_X);
+    const bool fk_check_is_running =
+        index->table->n_foreign_key_checks_running > 0;
+    const bool index_is_open = index->table->n_ref_count > 0;
+    const bool index_cannot_be_freed =
+        index_is_open || fk_check_is_running || dict_sys_mutex_own();
+    ut_ad(block_held_in_private || block_is_latched);
+    ut_ad(block_held_in_private || index_cannot_be_freed);
     /* For now, the only usage of the `force` param is in buf_LRU_free_page()
     while the block state is BUF_BLOCK_REMOVE_HASH. */
     ut_ad(block_held_in_private == force);
 
     ut_ad(!btr_search_own_any(RW_LOCK_S));
     ut_ad(!btr_search_own_any(RW_LOCK_X));
+#endif /* UNIV_DEBUG */
 
     block->ahi.validate();
     const auto prefix_info = block->ahi.prefix_info.load();
@@ -1973,15 +1931,11 @@ static bool btr_search_hash_table_validate(ulint part_id) {
       if (hash_block) {
         ut_a(hash_block == block);
       } else {
-        /* When a block is being freed,
-        buf_LRU_free_page() first
-        removes the block from
-        buf_pool->page_hash by calling
-        buf_LRU_block_remove_hashed_page().
-        After that, it invokes
-        buf_LRU_block_remove_hashed() to
-        remove the block from
-        btr_search_sys->hash_tables[i]. */
+        /* When a block is being freed, buf_LRU_free_page() first removes the
+        block from buf_pool->page_hash and sets it to BUF_BLOCK_REMOVE_HASH by
+        calling buf_LRU_block_remove_hashed(). After that, it removes the block
+        from btr_search_sys->parts[i] (the AHI) by calling
+        btr_search_drop_page_hash_index(). */
 
         ut_a(buf_block_get_state(block) == BUF_BLOCK_REMOVE_HASH);
       }
